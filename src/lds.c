@@ -9,52 +9,59 @@
 #include <pthread.h>
 
 // Event size and event buffer length.
-#define DSYNC_EVENT_SIZE  ( sizeof ( struct inotify_event ) )
-#define DSYNC_EVENT_BUFFER_LENGTH ( 1024 * ( DSYNC_EVENT_SIZE + 16 ) )
+#define LDS_EVENT_SIZE  ( sizeof ( struct inotify_event ) )
+#define LDS_EVENT_BUFFER_LENGTH ( 1024 * ( LDS_EVENT_SIZE + 16 ) )
 
 // Types of events to listen to.
-#define DSYNC_DIR_EVENT_TYPES IN_ATTRIB|IN_CREATE|IN_DELETE|IN_DELETE_SELF|IN_MOVE_SELF|IN_MOVED_FROM|IN_MOVED_TO
-#define DSYNC_FILE_EVENT_TYPES IN_ACCESS|IN_ATTRIB|IN_CLOSE_WRITE|IN_CLOSE_NOWRITE|IN_MODIFY
+#define LDS_DIR_EVENT_TYPES IN_ATTRIB|IN_CREATE|IN_DELETE|IN_DELETE_SELF|IN_MOVE_SELF|IN_MOVED_FROM|IN_MOVED_TO
+#define LDS_FILE_EVENT_TYPES IN_ACCESS|IN_ATTRIB|IN_CLOSE_WRITE|IN_CLOSE_NOWRITE|IN_MODIFY
 
 // Base rsync command (for initial sync).
-const char *dsync_rsync_base = "rsync -azv --delete --fuzzy --partial";
+const char *lds_rsync_base = "rsync -azv --delete --fuzzy --partial";
 
 // Source and destination paths (global).
 char *source_path;
 char *destination_path;
 
 // Number of current notifiers.
-int dsync_watcher_count;
-int DSYNC_MAX_WATCHERS;
+int lds_watcher_count;
+int LDS_MAX_WATCHERS;
+
+// File info container.
+typedef struct lds_file {
+  char *path;
+  long source_position;
+  long destination_position;
+} lds_file;
 
 // List of notifiers.
-typedef struct dsync_notifier {
+typedef struct lds_notifier {
   int notifier;
-  char **watchers;
-} dsync_notifier;
+  lds_file *watchers;
+} lds_notifier;
 
 // Return value from adding items.
-typedef struct dsync_notifier_pointer {
-  dsync_notifier *directory;
-  dsync_notifier *file;
-} dsync_notifier_pointer;
+typedef struct lds_notifier_pointer {
+  lds_notifier *directory;
+  lds_notifier *file;
+} lds_notifier_pointer;
 
 // Global notifier pointer.
-dsync_notifier_pointer notifier_pointer;
+lds_notifier_pointer notifier_pointer;
 
 // Functions.
-int dsync_verify_directory( char * );
-void *dsync_directory_notifier( void * );
-void *dsync_file_notifier( void * );
-int dsync_notifier_thread( dsync_notifier *, int );
-int dsync_watch( char *, int );
-int dsync_watch_directory( char * );
-int dsync_watch_file( char * );
-int dsync_add_items( char * );
-int dsync_start( );
+int lds_verify_directory( char * );
+void *lds_directory_notifier( void * );
+void *lds_file_notifier( void * );
+int lds_notifier_thread( lds_notifier *, int );
+int lds_watch( char *, int );
+int lds_watch_directory( char * );
+int lds_watch_file( char * );
+int lds_add_items( char * );
+int lds_start( );
 
 // Make sure directory exists.
-int dsync_verify_directory( char *directory ) {
+int lds_verify_directory( char *directory ) {
   struct stat fstat;
 
   // lstat() this directory.
@@ -73,19 +80,19 @@ int dsync_verify_directory( char *directory ) {
 }
 
 // Directory notifier.
-void *dsync_directory_notifier( void *args ) {
+void *lds_directory_notifier( void *args ) {
   int i;
   int length;
   struct inotify_event *event;
-  char buffer[DSYNC_EVENT_BUFFER_LENGTH];
+  char buffer[LDS_EVENT_BUFFER_LENGTH];
   char *temp_path;
-  dsync_notifier *notifier;
+  lds_notifier *notifier;
 
   // Infinitely wait for changes.
   notifier = notifier_pointer.directory;
   while ( 1 ) {
     // Read notification buffer.
-    if ( ( length = read( notifier->notifier, buffer, DSYNC_EVENT_BUFFER_LENGTH ) ) < 0 ) {
+    if ( ( length = read( notifier->notifier, buffer, LDS_EVENT_BUFFER_LENGTH ) ) < 0 ) {
       fprintf( stderr, "Error reading notifier!\n" );
       return;
     }
@@ -104,24 +111,24 @@ void *dsync_directory_notifier( void *args ) {
 
       // Check what type of change occurred.
       if ( event->len ) {
-        if ( ( temp_path = malloc( strlen( event->name ) + strlen( notifier->watchers[event->wd] ) + 2 ) ) == NULL ) {
-          sprintf( "Error watching new item: %s/%s\n", notifier->watchers[event->wd], event->name );
-          i += DSYNC_EVENT_SIZE + event->len;
+        if ( ( temp_path = malloc( strlen( event->name ) + strlen( notifier->watchers[event->wd].path ) + 2 ) ) == NULL ) {
+          sprintf( "Error watching new item: %s/%s\n", notifier->watchers[event->wd].path, event->name );
+          i += LDS_EVENT_SIZE + event->len;
           continue;
         }
-        sprintf( temp_path, "%s/%s", notifier->watchers[event->wd], event->name );
+        sprintf( temp_path, "%s/%s", notifier->watchers[event->wd].path, event->name );
         if ( event->mask & IN_CREATE ) {
           if ( event->mask & IN_ISDIR ) {
             printf( "New directory %s created.\n", event->name );
-            if ( dsync_watch_directory( temp_path ) == 0 ) {
+            if ( lds_watch_directory( temp_path ) == 0 ) {
               fprintf( stderr, "Error watching new directory: %s\n", temp_path );
-              i += DSYNC_EVENT_SIZE + event->len;
+              i += LDS_EVENT_SIZE + event->len;
               continue;
             }
           } else {
-            if ( dsync_watch_file( temp_path ) == 0 ) {
+            if ( lds_watch_file( temp_path ) == 0 ) {
               fprintf( stderr, "Error watching new file: %s/%s\n", temp_path );
-              i += DSYNC_EVENT_SIZE + event->len;
+              i += LDS_EVENT_SIZE + event->len;
               continue;
             }
           }
@@ -129,7 +136,7 @@ void *dsync_directory_notifier( void *args ) {
           if ( event->mask & IN_ISDIR ) {
             printf( "Directory %s deleted.\n", event->name );
           } else {
-            printf( "File %s deleted (in %s).\n", event->name, notifier->watchers[event->wd]);
+            printf( "File %s deleted (in %s).\n", event->name, notifier->watchers[event->wd].path );
           }
         } else if ( event->mask & IN_MOVED_FROM || event->mask & IN_MOVED_TO ) {
           if ( event->mask & IN_ISDIR ) {
@@ -140,62 +147,50 @@ void *dsync_directory_notifier( void *args ) {
         }
       }
       // Go to next event.
-      i += DSYNC_EVENT_SIZE + event->len;
+      i += LDS_EVENT_SIZE + event->len;
     }
   }
 }
 
 // File notifier.
-void *dsync_file_notifier( void *args ) {
-  dsync_notifier *notifier;
+void *lds_file_notifier( void *args ) {
+  lds_notifier *notifier;
   int length;
   int i;
   struct inotify_event *event;
-  char buffer[DSYNC_EVENT_BUFFER_LENGTH];
+  char buffer[LDS_EVENT_BUFFER_LENGTH];
 
+  // Set notifier pointer to file notifier.
   notifier = notifier_pointer.file;
 
-WATCH:
-  length = 0;
-  if ( ( length = read( notifier->notifier, buffer, DSYNC_EVENT_BUFFER_LENGTH ) ) < 0 ) {
-    fprintf( stderr, "Error reading notifier!\n" );
-    return;
-  }
-fprintf( stderr, "Buffer: %d\n", length );
-
-  i = 0;
-  while ( i < length ) {
-    event = ( struct inotify_event * ) &buffer[ i ];
-    if ( event->mask & IN_MODIFY ) {
-      fprintf( stderr, "File modified: %s\n", notifier->watchers[event->wd] );
+  // Infinitely monitor for changes.
+  while ( 1 ) {
+    // Read notifications.
+    if ( ( length = read( notifier->notifier, buffer, LDS_EVENT_BUFFER_LENGTH ) ) < 0 ) {
+      fprintf( stderr, "Error reading notifier!\n" );
+      return;
     }
 
-    i += DSYNC_EVENT_SIZE + event->len;
-  }
-goto WATCH;
-}
-
-// Create a new thread for a notifier.
-int dsync_notifier_thread( dsync_notifier *notifier, int directory ) {
-  pthread_t thread;
-
-  if ( directory ) {
-    pthread_create( &thread, NULL, dsync_directory_notifier, ( void * )notifier );
-    pthread_detach( thread );
-  } else {
-    pthread_create( &thread, NULL, dsync_file_notifier, ( void * )notifier );
-    pthread_detach( thread );
+    // Loop through all events.
+    i = 0;
+    while ( i < length ) {
+      event = ( struct inotify_event * ) &buffer[ i ];
+      if ( event->mask & IN_MODIFY ) {
+        fprintf( stderr, "File modified: %s\n", notifier->watchers[event->wd].path );
+      }
+      i += LDS_EVENT_SIZE + event->len;
+    }
   }
 }
 
 // Add an item to be watched.
-int dsync_watch( char *path, int directory ) {
+int lds_watch( char *path, int directory ) {
   uint32_t flags;
-  dsync_notifier *notifier;
+  lds_notifier *notifier;
   int watcher;
 
   // Make sure we have enough watchers.
-  if ( dsync_watcher_count >= DSYNC_MAX_WATCHERS ) { 
+  if ( lds_watcher_count >= LDS_MAX_WATCHERS ) { 
     fprintf( stderr, "Error, out of inotify watchers!\n" );
     return 0;
   }
@@ -204,48 +199,49 @@ int dsync_watch( char *path, int directory ) {
   flags = 0;
   if ( directory ) {
     notifier = notifier_pointer.directory;
-    flags = DSYNC_DIR_EVENT_TYPES;
+    flags = LDS_DIR_EVENT_TYPES;
   } else {
     notifier = notifier_pointer.file;
-    flags = DSYNC_FILE_EVENT_TYPES;
+    flags = LDS_FILE_EVENT_TYPES;
   }
   if ( ( watcher = inotify_add_watch( notifier->notifier, path, flags ) ) < 0 ) {
     fprintf( stderr, "Error watching: %s\n", path );
     return 0;
   }
-  notifier->watchers[watcher] = strdup( path );
+  notifier->watchers[watcher].path = strdup( path );
+  notifier->watchers[watcher].source_position = 0;
+  notifier->watchers[watcher].destination_position = 0;
 
   // Add items from this sub-directory.
   if ( directory ) {
-    if ( dsync_add_items( path ) == 0 ) {
+    if ( lds_add_items( path ) == 0 ) {
       fprintf( stderr, "Error adding items in dir: %s\n", path );
       return 0;
     }
   }
-
-  fprintf( stderr, "Now watching: %s (%d)\n", path, directory );
+  fprintf( stderr, "Now watching: %s\n", path );
 
   // Success.
   return 1;
 }
 
 // Add a directory to be watched.
-int dsync_watch_directory( char *path ) {
-  return dsync_watch( path, 1 );
+int lds_watch_directory( char *path ) {
+  return lds_watch( path, 1 );
 }
 
 // Add a file to be watched.
-int dsync_watch_file( char *path ) {
-  return dsync_watch( path, 0 );
+int lds_watch_file( char *path ) {
+  return lds_watch( path, 0 );
 }
 
 // Recursively add directories to watch.
-int dsync_add_items( char *path ) {
+int lds_add_items( char *path ) {
   DIR *dir;
   struct dirent *item;
   struct stat fstat;
   char *temp_path;
-  dsync_notifier *result_notifier;
+  lds_notifier *result_notifier;
 
   // Open the directory.
   if ( ( dir = opendir( path ) ) == NULL ) {
@@ -284,11 +280,11 @@ int dsync_add_items( char *path ) {
         // Symlink.
         continue;
       } else if ( S_ISDIR( fstat.st_mode ) ) {
-        if ( dsync_watch_directory( temp_path ) == 0 ) {
+        if ( lds_watch_directory( temp_path ) == 0 ) {
           return 0;
         }
       } else if ( S_ISREG( fstat.st_mode ) ) {
-        if ( dsync_watch_file( temp_path ) == 0 ) {
+        if ( lds_watch_file( temp_path ) == 0 ) {
           return 0;
         }
       } else {
@@ -308,18 +304,18 @@ int dsync_add_items( char *path ) {
 }
 
 // Perform the initial sync.
-int dsync_initial_sync( ) {
+int lds_initial_sync( ) {
   int ret;
   int length;
   char *command;
 
   // Generate system command.
-  length = strlen( dsync_rsync_base ) + strlen( source_path ) + strlen( destination_path ) + 22;
+  length = strlen( lds_rsync_base ) + strlen( source_path ) + strlen( destination_path ) + 22;
   if ( ( command = malloc( length ) ) == NULL ) {
     fprintf( stderr, "Error performing initial sync!\n" );
     return 0;
   }
-  sprintf( command, "%s %s/ %s/ > /dev/null 2>&1", dsync_rsync_base, source_path, destination_path );
+  sprintf( command, "%s %s/ %s/ > /dev/null 2>&1", lds_rsync_base, source_path, destination_path );
   if ( ( ret = system( command ) ) != 0 ) {
     fprintf( stderr, "Error performing initial sync!\n" );
     return 0;
@@ -330,10 +326,10 @@ int dsync_initial_sync( ) {
 }
 
 // Get the total possible watchers for inotify.
-int dsync_max_watchers( ) {
+int lds_max_watchers( ) {
   FILE *max_watchers;
   int total;
-  char buffer[DSYNC_EVENT_BUFFER_LENGTH];
+  char buffer[LDS_EVENT_BUFFER_LENGTH];
   char *temp;
 
   // Read from /proc.
@@ -343,9 +339,8 @@ int dsync_max_watchers( ) {
   }
   temp = buffer;
   while ( ( *temp = fgetc( max_watchers ) ) >= 0 ) {
-    fprintf( stderr, "Got: %d\n", *temp );
     *temp++;
-    if ( temp - buffer >= DSYNC_EVENT_BUFFER_LENGTH - 2 ) {
+    if ( temp - buffer >= LDS_EVENT_BUFFER_LENGTH - 2 ) {
       fprintf( stderr, "max_user_watches too large to parse!\n" );
       return 0;
     }
@@ -356,18 +351,20 @@ int dsync_max_watchers( ) {
     total = total * 10 + ( *temp - '0' );
     *temp++;
   }
-  fprintf( stderr, "max_user_watches: %d\n", total );
-  DSYNC_MAX_WATCHERS = total;
+  fprintf( stderr, "Max watchers available: %d\n", total );
+  LDS_MAX_WATCHERS = total;
 }
 
-// Initialize a dsync instance.
-int dsync_start( ) {
+// Initialize a lds instance.
+int lds_start( ) {
   char *temp;
+  pthread_t directory_notifier;
+  pthread_t file_notifier;
 
   // Initialize notifiers pointer.
   notifier_pointer.directory = NULL;
   notifier_pointer.file = NULL;
-  dsync_watcher_count = 0;
+  lds_watcher_count = 0;
 
   // Remove trailing /'s.
   temp = source_path + strlen( source_path ) - 1;
@@ -380,20 +377,20 @@ int dsync_start( ) {
   }
 
   // Determine max watchers for this system.
-  if ( dsync_max_watchers( ) == 0 ) {
+  if ( lds_max_watchers( ) == 0 ) {
     return 0;
   }
 
   // Perform initial sync.
-  if ( dsync_initial_sync( ) == 0 ) {
+  if ( lds_initial_sync( ) == 0 ) {
     return 0;
   }
 
   // Create notifier pointer.
-  if ( ( notifier_pointer.directory = malloc( sizeof( dsync_notifier_pointer ) ) ) == NULL ) {
+  if ( ( notifier_pointer.directory = malloc( sizeof( lds_notifier_pointer ) ) ) == NULL ) {
     fprintf( stderr, "Error allocating memory for notifications!\n" );
     return 0;
-  } else if ( ( notifier_pointer.file = malloc( sizeof( dsync_notifier_pointer ) ) ) == NULL ) {
+  } else if ( ( notifier_pointer.file = malloc( sizeof( lds_notifier_pointer ) ) ) == NULL ) {
     fprintf( stderr, "Error allocating memory for notifications!\n" );
   }
   if ( ( notifier_pointer.directory->notifier = inotify_init( ) ) < 0 ) {
@@ -403,33 +400,44 @@ int dsync_start( ) {
     fprintf( stderr, "Error initializing inotify instance!\n" );
     return 0;
   }
-  if ( ( notifier_pointer.directory->watchers = malloc( sizeof( char * ) * DSYNC_MAX_WATCHERS ) ) == NULL ) {
+  if ( ( notifier_pointer.directory->watchers = malloc( sizeof( lds_file ) * LDS_MAX_WATCHERS ) ) == NULL ) {
     fprintf( stderr, "Error allocating memory for watchers!\n" );
     return 0;
   }
-  if ( ( notifier_pointer.file->watchers = malloc( sizeof( char * ) * DSYNC_MAX_WATCHERS ) ) == NULL ) {
+  if ( ( notifier_pointer.file->watchers = malloc( sizeof( lds_file ) * LDS_MAX_WATCHERS ) ) == NULL ) {
     fprintf( stderr, "Error allocating memory for watchers!\n" );
     return 0;
   }
 
-  dsync_notifier_thread( notifier_pointer.directory, 1 );
-  dsync_notifier_thread( notifier_pointer.file, 0 );
+  // Create the directory and file notifier threads.
+  pthread_create( &directory_notifier, NULL, lds_directory_notifier, ( void * )notifier_pointer.directory );
+  pthread_detach( directory_notifier );
+  pthread_create( &file_notifier, NULL, lds_file_notifier, ( void * )notifier_pointer.file );
+  pthread_detach( file_notifier );
 
   // Start watching.
-  if ( dsync_watch_directory( source_path ) == 0 ) {
+  if ( lds_watch_directory( source_path ) == 0 ) {
     return 0;
   }
 
-sleep( 100 );
-
-  // Success.
-  return 1;
+  // Make sure threads are alive.
+  while ( 1 ) {
+    if ( pthread_kill( directory_notifier, 0 ) == ESRCH ) {
+      fprintf( stderr, "Directory notifier died!\n" );
+      return 0;
+    }
+    if ( pthread_kill( file_notifier, 0 ) == ESRCH ) {
+      fprintf( stderr, "File notifier died!\n" );
+      return 0;
+    }
+    sleep( 1 );
+  }
 }
 
 // Main.
 int main( int argc, char *argv[] ) {
   int i;
-  char buffer[DSYNC_EVENT_BUFFER_LENGTH];
+  char buffer[LDS_EVENT_BUFFER_LENGTH];
   int length;
 
   // Validate args.
@@ -439,12 +447,12 @@ int main( int argc, char *argv[] ) {
   }
   source_path = argv[1];
   destination_path = argv[2];
-  if ( dsync_verify_directory( source_path ) == 0 || dsync_verify_directory( destination_path ) == 0 ) {
+  if ( lds_verify_directory( source_path ) == 0 || lds_verify_directory( destination_path ) == 0 ) {
     return 1;
   }
 
-  // Initialize dsync and start monitoring.
-  if ( dsync_start( ) == 0 ) {
+  // Initialize lds and start monitoring.
+  if ( lds_start( ) == 0 ) {
     return 1;
   }
 }
