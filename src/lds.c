@@ -38,27 +38,18 @@ typedef struct lds_file {
 
 // List of notifiers.
 typedef struct lds_notifier {
-  int notifier;
+  int fd;
   lds_file *watchers;
 } lds_notifier;
 
-// Return value from adding items.
-typedef struct lds_notifier_pointer {
-  lds_notifier *directory;
-  lds_notifier *file;
-} lds_notifier_pointer;
-
 // Global notifier pointer.
-lds_notifier_pointer notifier_pointer;
+lds_notifier *notifier;
 
 // Functions.
 int lds_verify_directory( char * );
-void *lds_directory_notifier( void * );
-void *lds_file_notifier( void * );
 int lds_notifier_thread( lds_notifier *, int );
 int lds_watch( char *, int );
 int lds_watch_directory( char * );
-int lds_watch_file( char * );
 int lds_add_items( char * );
 int lds_start( );
 
@@ -158,7 +149,7 @@ int lds_sync_directory( char *path ) {
 }
 
 // Remove a directory in destination path.
-int lds_remove_directory( int wd, char *directory ) {
+int lds_remove_item( int wd, char *directory ) {
   char *path;
   char destination_original[LDS_MAX_PATH];
   char destination[LDS_MAX_PATH * 2];
@@ -167,7 +158,7 @@ int lds_remove_directory( int wd, char *directory ) {
   // Wait for other syncs, then block.
   sem_wait( &lds_syncing );
 
-  path = notifier_pointer.directory->watchers[wd].path;
+  path = notifier->watchers[wd].path;
   partial = lds_path_without_base( path, lds_source_path );
   if ( partial && *partial ) {
     sprintf( destination_original, "%s/%s/%s", lds_destination_path, partial, directory );
@@ -184,57 +175,31 @@ int lds_remove_directory( int wd, char *directory ) {
   return 1;
 }
 
-// Remove a file in destination path.
-int lds_remove_file( int wd ) {
-  char *path;
-  char destination_original[LDS_MAX_PATH];
-  char destination[LDS_MAX_PATH * 2];
-
-  // Wait for other syncs, then block.
-  sem_wait( &lds_syncing );
-
-  // Delete the file.
-  path = notifier_pointer.file->watchers[wd].path;
-  sprintf( destination_original, "%s/%s", lds_destination_path, lds_path_without_base( path, lds_source_path ) );
-  lds_escape_path( destination_original, destination );
-  fprintf( stderr, "Run: rm -f %s\n", destination );
-
-  // Remove the watcher.
-  inotify_rm_watch( notifier_pointer.file->notifier, wd );
-
-  // Unlock sync.
-  sem_post( &lds_syncing );
-
-  // Success.
-  return 1;
-}
-
 // Create a directory in destination path.
 int lds_create_directory( char *path ) {
   return lds_sync_directory( path );
 }
 
 // Directory notifier.
-void *lds_directory_notifier( void *args ) {
+void *lds_notifier_worker( void * args ) {
   int i;
   int length;
+  struct stat fstat;
   uint32_t last_cookie;
   struct inotify_event *event;
   struct inotify_event *next;
   char buffer[LDS_EVENT_BUFFER_LENGTH];
   char temp_path[LDS_MAX_PATH];
   char next_path[LDS_MAX_PATH];
-  lds_notifier *notifier;
 
   // Wait for the initialization lock.
   sem_wait( &lds_init_wait );
   sem_post( &lds_init_wait );
 
   // Infinitely wait for changes.
-  notifier = notifier_pointer.directory;
   while ( 1 ) {
     // Read notification buffer.
-    if ( ( length = read( notifier->notifier, buffer, LDS_EVENT_BUFFER_LENGTH ) ) < 0 ) {
+    if ( ( length = read( notifier->fd, buffer, LDS_EVENT_BUFFER_LENGTH ) ) < 0 ) {
       fprintf( stderr, "Error reading notifier (%d)!\n", errno );
       return;
     }
@@ -267,8 +232,8 @@ void *lds_directory_notifier( void *args ) {
       if ( event->len ) {
         sprintf( temp_path, "%s/%s", notifier->watchers[event->wd].path, event->name );
 
-        // Item was created.
         if ( event->mask & IN_CREATE ) {
+          // Creations.
           if ( event->mask & IN_ISDIR ) {
             // Directory was created, add it to watcher.
             printf( "Directory created: %s\n", temp_path );
@@ -280,23 +245,20 @@ void *lds_directory_notifier( void *args ) {
           } else {
             // File was created, add it to watcher.
             fprintf( stderr, "File created: %s\n", temp_path );
-            if ( lds_watch_file( temp_path ) == 0 ) {
-              fprintf( stderr, "Error watching new file: %s/%s\n", temp_path );
-              i += LDS_EVENT_SIZE + event->len;
-              continue;
-            }
           }
-        }
-
-        // Item was deleted.
-        if ( event->mask & IN_DELETE && event->mask & IN_ISDIR ) {
-          // Directory was deleted.
-          fprintf( stderr, "Directory deleted 1: %s\n", temp_path );
-          lds_remove_directory( event->wd, event->name );
-        }
-
-        // Item was moved.
-        if ( event->mask & IN_MOVED_FROM ) {
+        } else if ( event->mask & IN_DELETE ) {
+          // Deletions.
+          if ( event->mask & IN_ISDIR ) {
+            // Directory was deleted.
+            fprintf( stderr, "Directory deleted: %s\n", temp_path );
+            lds_remove_item( event->wd, event->name );
+          } else {
+            // File was deleted.
+            fprintf( stderr, "File deleted: %s\n", temp_path );
+            lds_remove_item( event->wd, event->name );
+          }
+        } else if ( event->mask & IN_MOVED_FROM ) {
+          // Moves/renames.
           if ( next && next->cookie == event->cookie ) {
             // Item was renamed.
             if ( event->mask & IN_ISDIR ) {
@@ -307,8 +269,13 @@ void *lds_directory_notifier( void *args ) {
               fprintf( stderr, "File renamed: %s => %s\n", temp_path, next_path );
             }
           } else {
-            // File was moved from.
-            fprintf( stderr, "File moved: %s\n", temp_path );
+            if ( event->mask & IN_ISDIR ) {
+              // Directory was moved from an external directory into this directory.
+              fprintf( stderr, "Directory moved into watched dir: %s\n", temp_path );
+            } else {
+              // File was moved from an external directory into this directory.
+              fprintf( stderr, "File moved into watched dir: %s\n", temp_path );
+            }
           }
         } else if ( event->mask & IN_MOVED_TO ) {
           if ( event->mask & IN_ISDIR ) {
@@ -317,6 +284,39 @@ void *lds_directory_notifier( void *args ) {
           } else {
             // File was moved to.
             fprintf( stderr, "File moved:%s\n", temp_path );
+          }
+        } else {
+          // Stat the item.
+          if ( lstat( temp_path, &fstat ) < 0 ) {
+            fprintf( stderr, "Unable to stat: %s\n", temp_path );
+            i += LDS_EVENT_SIZE + event->len;
+            continue;
+          }
+
+          // Check the type of file.
+          if ( S_ISREG( fstat.st_mode ) == 0 ) {
+            i += LDS_EVENT_SIZE + event->len;
+            continue;
+          }
+
+          if ( event->mask & IN_MODIFY ) {
+            // File was modified.
+            fprintf( stderr, "File modified: %s\n", temp_path );
+          }
+
+          if ( event->mask & IN_ACCESS ) {
+            // File was accessed.
+            fprintf( stderr, "File accessed: %s\n", temp_path );
+          }
+
+          if ( event->mask & IN_OPEN ) {
+            // File was opened.
+            fprintf( stderr, "File opened: %s\n", temp_path );
+          }
+
+          if ( event->mask & IN_CLOSE ) {
+            // File was closed.
+            fprintf( stderr, "File closed: %s\n", temp_path );
           }
         }
       }
@@ -327,72 +327,8 @@ void *lds_directory_notifier( void *args ) {
   }
 }
 
-// File notifier.
-void *lds_file_notifier( void *args ) {
-  lds_notifier *notifier;
-  int length;
-  int i;
-  struct inotify_event *event;
-  char buffer[LDS_EVENT_BUFFER_LENGTH];
-  char *temp_path;
-
-  // Wait for the initialization lock.
-  sem_wait( &lds_init_wait );
-  sem_post( &lds_init_wait );
-
-  // Set notifier pointer to file notifier.
-  notifier = notifier_pointer.file;
-
-  // Infinitely monitor for changes.
-  while ( 1 ) {
-    // Read notifications.
-    if ( ( length = read( notifier->notifier, buffer, LDS_EVENT_BUFFER_LENGTH ) ) < 0 ) {
-      fprintf( stderr, "Error reading notifier!\n" );
-      continue;//return;
-    }
-
-    // Loop through all events.
-    i = 0;
-    while ( i < length ) {
-      event = ( struct inotify_event * ) &buffer[ i ];
-      temp_path = notifier->watchers[event->wd].path;
-      if ( event->mask & IN_DELETE_SELF ) {
-        // File was deleted, remove the watcher.
-        fprintf( stderr, "File deleted: %s\n", temp_path );
-        lds_remove_file( event->wd );
-      }
-      if ( event->mask & IN_OPEN ) {
-        // File was opened.
-        fprintf( stderr, "File opened: %s\n", temp_path );
-      }
-      if ( event->mask & IN_MODIFY ) {
-        // File was modified.
-        fprintf( stderr, "File modified: %s\n", temp_path );
-      }
-      if ( event->mask & IN_ACCESS ) {
-        // File was accessed.
-        fprintf( stderr, "File accessed: %s\n", temp_path );
-      }
-      if ( event->mask & IN_ATTRIB ) {
-        // File attributes modified.
-        fprintf( stderr, "File attribute change: %s\n", temp_path );
-      }
-      if ( event->mask & IN_CLOSE_WRITE ) {
-        // File that was opened for writing was closed.
-        fprintf( stderr, "File opened for writing closed: %s\n", temp_path );
-      }
-      if ( event->mask & IN_CLOSE_NOWRITE ) {
-        // File that was opened for reading was closed.
-        fprintf( stderr, "File opened for reading closed: %s\n", temp_path );
-      }
-      i += LDS_EVENT_SIZE + event->len;
-    }
-  }
-}
-
 // Add an item to be watched.
-int lds_watch( char *path, int directory ) {
-  lds_notifier *notifier;
+int lds_watch_directory( char *path ) {
   int watcher;
 
   // Make sure we have enough watchers.
@@ -402,8 +338,7 @@ int lds_watch( char *path, int directory ) {
   }
 
   // Start watching.
-  notifier = directory ? notifier_pointer.directory : notifier_pointer.file;
-  if ( ( watcher = inotify_add_watch( notifier->notifier, path, IN_ALL_EVENTS ) ) < 0 ) {
+  if ( ( watcher = inotify_add_watch( notifier->fd, path, IN_ALL_EVENTS ) ) < 0 ) {
     if ( errno == ENOSPC ) {
       fprintf( stderr, "Error, no more watchers! (stopped at: %d)\n", lds_watcher_count );
       exit( 1 );
@@ -418,32 +353,14 @@ int lds_watch( char *path, int directory ) {
   notifier->watchers[watcher].destination_position = 0;
 
   // Add items from this sub-directory.
-  if ( directory ) {
-    if ( lds_add_items( path ) == 0 ) {
-      fprintf( stderr, "Error adding items in dir: %s\n", path );
-      return 0;
-    }
+  if ( lds_add_items( path ) == 0 ) {
+    fprintf( stderr, "Error adding items in dir: %s\n", path );
+    return 0;
   }
   fprintf( stderr, "Now watching: %s\n", path );
 
   // Success.
   return 1;
-}
-
-// Add a directory to be watched.
-int lds_watch_directory( char *path ) {
-  int ret;
-
-  ret = lds_watch( path, 1 );
-  if ( ret ) {
-    lds_create_directory( path );
-  }
-  return ret;
-}
-
-// Add a file to be watched.
-int lds_watch_file( char *path ) {
-  return lds_watch( path, 0 );
 }
 
 // Recursively add directories to watch.
@@ -477,19 +394,18 @@ int lds_add_items( char *path ) {
     if ( lstat( temp_path, &fstat ) >= 0 ) {
       // Take action based on file type.
       if ( S_ISLNK( fstat.st_mode ) || S_ISCHR( fstat.st_mode ) || S_ISBLK( fstat.st_mode ) || S_ISFIFO( fstat.st_mode ) || S_ISSOCK( fstat.st_mode ) ) {
-        fprintf( stderr, "Skipping invalid file type: %s\n", temp_path );
+        // Invalid file type.
         continue;
       } else if ( S_ISLNK( fstat.st_mode ) ) {
         // Symlink.
         continue;
       } else if ( S_ISDIR( fstat.st_mode ) ) {
+        // Directory.
         if ( lds_watch_directory( temp_path ) == 0 ) {
           return 0;
         }
       } else if ( S_ISREG( fstat.st_mode ) ) {
-        if ( lds_watch_file( temp_path ) == 0 ) {
-          return 0;
-        }
+        // Regular file.
       } else {
         // Unknown file type.
         fprintf( stderr, "Error, unknown file type: %s\n", temp_path );
@@ -541,8 +457,7 @@ int lds_max_watchers( ) {
 // Initialize a lds instance.
 int lds_start( ) {
   char *temp;
-  pthread_t directory_notifier;
-  pthread_t file_notifier;
+  pthread_t runner;
 
   // Initialize semaphores.
   sem_init( &lds_init_wait, 0, 1 );
@@ -550,8 +465,7 @@ int lds_start( ) {
   sem_wait( &lds_init_wait );
 
   // Initialize notifiers pointer.
-  notifier_pointer.directory = NULL;
-  notifier_pointer.file = NULL;
+  notifier = NULL;
   lds_watcher_count = 0;
 
   // Remove trailing /'s.
@@ -570,33 +484,22 @@ int lds_start( ) {
   }
 
   // Create notifier pointer.
-  if ( ( notifier_pointer.directory = malloc( sizeof( lds_notifier_pointer ) ) ) == NULL ) {
+  if ( ( notifier = malloc( sizeof( lds_notifier ) ) ) == NULL ) {
     fprintf( stderr, "Error allocating memory for notifications!\n" );
     return 0;
-  } else if ( ( notifier_pointer.file = malloc( sizeof( lds_notifier_pointer ) ) ) == NULL ) {
-    fprintf( stderr, "Error allocating memory for notifications!\n" );
   }
-  if ( ( notifier_pointer.directory->notifier = inotify_init( ) ) < 0 ) {
-    fprintf( stderr, "Error initializing inotify instance!\n" );
-    return 0;
-  } else if ( ( notifier_pointer.file->notifier = inotify_init( ) ) < 0 ) {
+  if ( ( notifier->fd = inotify_init( ) ) < 0 ) {
     fprintf( stderr, "Error initializing inotify instance!\n" );
     return 0;
   }
-  if ( ( notifier_pointer.directory->watchers = malloc( sizeof( lds_file ) * LDS_MAX_WATCHERS ) ) == NULL ) {
-    fprintf( stderr, "Error allocating memory for watchers!\n" );
-    return 0;
-  }
-  if ( ( notifier_pointer.file->watchers = malloc( sizeof( lds_file ) * LDS_MAX_WATCHERS ) ) == NULL ) {
+  if ( ( notifier->watchers = malloc( sizeof( lds_file ) * LDS_MAX_WATCHERS ) ) == NULL ) {
     fprintf( stderr, "Error allocating memory for watchers!\n" );
     return 0;
   }
 
-  // Create the directory and file notifier threads.
-  pthread_create( &directory_notifier, NULL, lds_directory_notifier, ( void * )notifier_pointer.directory );
-  pthread_detach( directory_notifier );
-  pthread_create( &file_notifier, NULL, lds_file_notifier, ( void * )notifier_pointer.file );
-  pthread_detach( file_notifier );
+  // Create the watcher thread.
+  pthread_create( &runner, NULL, lds_notifier_worker, NULL );
+  pthread_detach( runner );
 
   // Start watching.
   if ( lds_watch_directory( lds_source_path ) == 0 ) {
@@ -608,12 +511,8 @@ int lds_start( ) {
 
   // Make sure threads are alive.
   while ( 1 ) {
-    if ( pthread_kill( directory_notifier, 0 ) == ESRCH ) {
-      fprintf( stderr, "Directory notifier died!\n" );
-      return 0;
-    }
-    if ( pthread_kill( file_notifier, 0 ) == ESRCH ) {
-      fprintf( stderr, "File notifier died!\n" );
+    if ( pthread_kill( runner, 0 ) == ESRCH ) {
+      fprintf( stderr, "Notifier died!\n" );
       return 0;
     }
     sleep( 1 );
