@@ -20,6 +20,7 @@ sem_t lds_syncing;
 
 // Base rsync command (for initial sync).
 const char *lds_rsync_base = "rsync -azv --delete --fuzzy --partial";
+const char *lds_rsync_append = "rsync -azv --append";
 
 // Source and destination paths (global).
 char *lds_source_path;
@@ -72,8 +73,40 @@ void lds_escape_path( char *original, char escaped[LDS_MAX_PATH] ) {
   }
 }
 
+// Create the lds directory in destination.
+int lds_create_destination_directory( ) {
+  char *path;
+  struct stat fstat;
+
+  // lstat() the directory to see if it exists.
+  if ( ( path = malloc( strlen( lds_destination_path ) + strlen( "/lds-data" ) + 1 ) ) == NULL ) {
+    fprintf( stderr, "Error storing destination path!\n" );
+    return 0;
+  }
+  sprintf( path, "%s/lds-data", lds_destination_path );
+  if ( lstat( path, &fstat ) == 0 ) {
+    if ( ! fstat.st_mode & S_IFDIR ) {
+      fprintf( stderr, "%s is not a directory!\n", path );
+      return 0;
+    }
+  } else {
+    // Create the directory.
+    if ( mkdir( path, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH ) < 0 ) {
+      fprintf( stderr, "Error creating lds directory: %s\n", path );
+      return 0;
+    }
+  }
+
+  // Change destination path.
+  lds_destination_path = path;
+
+  // Success.
+  return 1;
+}
+
 // Make sure directory exists.
 int lds_verify_directory( char *directory ) {
+  char *temp;
   struct stat fstat;
 
   // lstat() this directory.
@@ -85,6 +118,12 @@ int lds_verify_directory( char *directory ) {
   } else {
     fprintf( stderr, "No such directory: %s\n", directory );
     return 0;
+  }
+
+  // Remove trailing /'s.
+  temp = directory + strlen( directory ) - 1;
+  while ( temp - directory > 0 && *temp == '/' ) {
+    *temp-- = '\0';
   }
 
   // Success.
@@ -113,7 +152,7 @@ char *lds_path_without_base( char *path, char *base ) {
 int lds_sync_directory( char *path ) {
   int ret;
   int length;
-  char command[LDS_MAX_PATH * 2];
+  char command[LDS_MAX_PATH * 3];
   char source_original[LDS_MAX_PATH];
   char destination_original[LDS_MAX_PATH];
   char source[LDS_MAX_PATH];
@@ -125,48 +164,108 @@ int lds_sync_directory( char *path ) {
 
   // Generate full source and destination directories.
   partial = lds_path_without_base( path, lds_source_path );
-  sprintf( source_original, "%s/%s/", lds_source_path, partial );
-  sprintf( destination_original, "%s/%s/", lds_destination_path, partial );
+  if ( partial && *partial ) {
+    sprintf( source_original, "%s/%s/", lds_source_path, partial );
+    sprintf( destination_original, "%s/%s/", lds_destination_path, partial );
+  } else {
+    sprintf( source_original, "%s/", lds_source_path );
+    sprintf( destination_original, "%s/", lds_destination_path );
+  }
   lds_escape_path( source_original, source );
   lds_escape_path( destination_original, destination );
 
   // Generate system command.
-  sprintf( command, "%s %s %s >/dev/null 2>&1", lds_rsync_base, source, destination );
+  sprintf( command, "%s %s %s > /dev/null 2>&1", lds_rsync_base, source, destination );
   fprintf( stderr, "Command: %s\n", command );
 
   // Run the command.
-  //if ( ( ret = system( command ) ) != 0 ) {
-  //  fprintf( stderr, "Error syncing: %s\n", path );
-  //  sem_post( &lds_syncing );
-  //  return 0;
-  //}
+  if ( ( ret = system( command ) ) != 0 ) {
+    fprintf( stderr, "Error syncing: %s\n", path );
+    sem_post( &lds_syncing );
+    return 0;
+  }
 
   // Unlock sync.
   sem_post( &lds_syncing );
+
+  // Success.
+  return 1;
+}
+
+// Recursively delete an item.
+int lds_recursive_delete( char *path ) {
+  DIR *dir;
+  struct dirent *item;
+  char target[LDS_MAX_PATH];
+  struct stat fstat;
+
+  // Stat the item.
+  if ( lstat( path, &fstat ) < 0 ) {
+    fprintf( stderr, "Error trying stat: %s\n", path );
+    return 0;
+  }
+
+  if ( S_ISDIR( fstat.st_mode ) ) {
+    // Read directory and delete files.
+    if ( ( dir = opendir( path ) ) == NULL ) {
+      fprintf( stderr, "Error openining directory: %s\n", path );
+      return 0;
+    }
+
+    // Read items from this directory.
+    while ( ( item = readdir( dir ) ) != NULL ) {
+      // Ignore '.' and '..'
+      if ( strcmp( item->d_name, ".." ) == 0 || strcmp( item->d_name, "." ) == 0 ) {
+        continue;
+      }
+
+      // Delete this item.
+      memset( target, '\0', LDS_MAX_PATH );
+      sprintf( target, "%s/%s", path, item->d_name );
+      if ( lds_recursive_delete( path ) == 0 ) {
+        return 0;
+      }
+    }
+
+    // Close the directory and delete it.
+    closedir( dir );
+    if ( rmdir( path ) < 0 ) {
+      return 0;
+    }
+  } else {
+    // Normal file, delete it.
+    if ( unlink( path ) < 0 ) {
+      fprintf( stderr, "Error deleting: %s\n", path );
+      return 0;
+    }
+  }
 
   // Success.
   return 1;
 }
 
 // Remove a directory in destination path.
-int lds_remove_item( int wd, char *directory ) {
+int lds_remove_item( int wd, char *name ) {
   char *path;
-  char destination_original[LDS_MAX_PATH];
-  char destination[LDS_MAX_PATH * 2];
+  char destination[LDS_MAX_PATH];
   char *partial;
 
   // Wait for other syncs, then block.
   sem_wait( &lds_syncing );
 
+  // Get the paths.
   path = notifier->watchers[wd].path;
   partial = lds_path_without_base( path, lds_source_path );
   if ( partial && *partial ) {
-    sprintf( destination_original, "%s/%s/%s", lds_destination_path, partial, directory );
+    sprintf( destination, "%s/%s/%s", lds_destination_path, partial, name );
   } else {
-    sprintf( destination_original, "%s/%s", lds_destination_path, directory );
+    sprintf( destination, "%s/%s", lds_destination_path, name );
   }
-  lds_escape_path( destination_original, destination );
-  fprintf( stderr, "Run: rm -rf %s\n", destination );
+
+  // Recursively delete.
+  if ( lds_recursive_delete( destination ) == 0 ) {
+    fprintf( stderr, "Unable to delete: %s\n", destination );
+  }
 
   // Unlock sync.
   sem_post( &lds_syncing );
@@ -175,9 +274,63 @@ int lds_remove_item( int wd, char *directory ) {
   return 1;
 }
 
-// Create a directory in destination path.
-int lds_create_directory( char *path ) {
-  return lds_sync_directory( path );
+// Create a file in destination path.
+int lds_sync_file( char *path ) {
+  char destination[LDS_MAX_PATH];
+  char e_path[LDS_MAX_PATH * 2];
+  char e_destination[LDS_MAX_PATH * 2];
+  char command[LDS_MAX_PATH * 3];
+  char *partial;
+  int ret;
+
+  // Wait for other syncs, then block.
+  sem_wait( &lds_syncing );
+
+  // Generate the rsync command.
+  partial = lds_path_without_base( path, lds_source_path );
+  if ( partial && *partial ) {
+    sprintf( destination, "%s/%s", lds_destination_path, partial );
+  }
+  lds_escape_path( destination, e_destination );
+  lds_escape_path( path, e_path );
+  sprintf( command, "%s %s %s > /dev/null 2>&1", lds_rsync_append, e_path, e_destination );
+  fprintf( stderr, "Sync file: %s\n", command );
+
+  // Run the command.
+  if ( ( ret = system( command ) ) != 0 ) {
+    fprintf( stderr, "Error syncing: %s\n", path );
+    sem_post( &lds_syncing );
+    return 0;
+  }
+
+  // Unlock sync.
+  sem_post( &lds_syncing );
+
+  // Success.
+  return 1;
+}
+
+// Rename a file.
+int lds_rename_item( char *original, char *new_name ) {
+  char *o_partial;
+  char *n_partial;
+  char d_source[LDS_MAX_PATH];
+  char d_destination[LDS_MAX_PATH];
+
+  // Get paths.
+  o_partial = lds_path_without_base( original, lds_source_path );
+  n_partial = lds_path_without_base( new_name, lds_source_path );
+  sprintf( d_source, "%s/%s", lds_destination_path, o_partial );
+  sprintf( d_destination, "%s/%s", lds_destination_path, n_partial );
+
+  // Rename the item.
+  if ( rename( d_source, d_destination ) != 0 ) {
+    fprintf( stderr, "Error renaming: %s => %s\n", d_source, d_destination );
+    return 0;
+  }
+
+  // Success.
+  return 1;
 }
 
 // Directory notifier.
@@ -195,6 +348,12 @@ void *lds_notifier_worker( void * args ) {
   // Wait for the initialization lock.
   sem_wait( &lds_init_wait );
   sem_post( &lds_init_wait );
+
+  // Perform the initial sync.
+  if ( lds_sync_directory( lds_source_path ) == 0 ) {
+    fprintf( stderr, "Error performing initial sync!\n" );
+    exit( 1 );
+  }
 
   // Infinitely wait for changes.
   while ( 1 ) {
@@ -241,10 +400,15 @@ void *lds_notifier_worker( void * args ) {
               fprintf( stderr, "Error watching new directory: %s\n", temp_path );
               i += LDS_EVENT_SIZE + event->len;
               continue;
+            } else if ( lds_sync_directory( temp_path ) == 0 ) {
+              i += LDS_EVENT_SIZE + event->len;
             }
           } else {
             // File was created, add it to watcher.
             fprintf( stderr, "File created: %s\n", temp_path );
+            if ( lds_sync_file( temp_path ) == 0 ) {
+              i += LDS_EVENT_SIZE + event->len;
+            }
           }
         } else if ( event->mask & IN_DELETE ) {
           // Deletions.
@@ -261,13 +425,8 @@ void *lds_notifier_worker( void * args ) {
           // Moves/renames.
           if ( next && next->cookie == event->cookie ) {
             // Item was renamed.
-            if ( event->mask & IN_ISDIR ) {
-              // Directory was renamed.
-              fprintf( stderr, "Directory renamed: %s => %s\n", temp_path, next_path );
-            } else {
-              // File was renamed.
-              fprintf( stderr, "File renamed: %s => %s\n", temp_path, next_path );
-            }
+            fprintf( stderr, "Rename: %s => %s\n", temp_path, next_path );
+            lds_rename_item( temp_path, next_path );
           } else {
             if ( event->mask & IN_ISDIR ) {
               // Directory was moved from an external directory into this directory.
@@ -285,10 +444,9 @@ void *lds_notifier_worker( void * args ) {
             // File was moved to.
             fprintf( stderr, "File moved:%s\n", temp_path );
           }
-        } else {
-          // Stat the item.
+        } else if ( event->mask & IN_MODIFY || event->mask & IN_ATTRIB ) {
+          // Check if it's a file.
           if ( lstat( temp_path, &fstat ) < 0 ) {
-            fprintf( stderr, "Unable to stat: %s\n", temp_path );
             i += LDS_EVENT_SIZE + event->len;
             continue;
           }
@@ -302,21 +460,15 @@ void *lds_notifier_worker( void * args ) {
           if ( event->mask & IN_MODIFY ) {
             // File was modified.
             fprintf( stderr, "File modified: %s\n", temp_path );
+            if ( lds_sync_file( temp_path ) == 0 ) {
+              i += LDS_EVENT_SIZE + event->len;
+              continue;
+            }
           }
 
-          if ( event->mask & IN_ACCESS ) {
-            // File was accessed.
-            fprintf( stderr, "File accessed: %s\n", temp_path );
-          }
-
-          if ( event->mask & IN_OPEN ) {
-            // File was opened.
-            fprintf( stderr, "File opened: %s\n", temp_path );
-          }
-
-          if ( event->mask & IN_CLOSE ) {
-            // File was closed.
-            fprintf( stderr, "File closed: %s\n", temp_path );
+          if ( event->mask & IN_ATTRIB ) {
+            // Attributes changed.
+            fprintf( stderr, "Attributes changed: %s\n", temp_path );
           }
         }
       }
@@ -456,7 +608,6 @@ int lds_max_watchers( ) {
 
 // Initialize a lds instance.
 int lds_start( ) {
-  char *temp;
   pthread_t runner;
 
   // Initialize semaphores.
@@ -467,16 +618,6 @@ int lds_start( ) {
   // Initialize notifiers pointer.
   notifier = NULL;
   lds_watcher_count = 0;
-
-  // Remove trailing /'s.
-  temp = lds_source_path + strlen( lds_source_path ) - 1;
-  while ( temp - lds_source_path > 0 && *temp == '/' ) {
-    *temp-- = '\0';
-  }
-  temp = lds_destination_path + strlen( lds_destination_path ) - 1;
-  while ( temp - lds_destination_path > 0 && *temp == '/' ) {
-    *temp-- = '\0';
-  }
 
   // Determine max watchers for this system.
   if ( lds_max_watchers( ) == 0 ) {
@@ -532,7 +673,7 @@ int main( int argc, char *argv[] ) {
   }
   lds_source_path = argv[1];
   lds_destination_path = argv[2];
-  if ( lds_verify_directory( lds_source_path ) == 0 || lds_verify_directory( lds_destination_path ) == 0 ) {
+  if ( lds_verify_directory( lds_source_path ) == 0 || lds_verify_directory( lds_destination_path ) == 0 || lds_create_destination_directory( ) == 0 ) {
     return 1;
   }
 
