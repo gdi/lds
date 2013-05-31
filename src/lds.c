@@ -19,8 +19,9 @@ sem_t lds_init_wait;
 sem_t lds_syncing;
 
 // Base rsync command (for initial sync).
-const char *lds_rsync_base = "rsync -azv --delete --fuzzy --partial";
-const char *lds_rsync_append = "rsync -azv --append";
+const char *lds_rsync_base = "rsync -azv --delete --fuzzy --partial --inplace";
+const char *lds_rsync_append = "rsync -azv --append --inplace";
+const char *lds_rsync_partial = "rsync -azv --partial --inplace";
 
 // Source and destination paths (global).
 char *lds_source_path;
@@ -64,7 +65,8 @@ void lds_escape_path( char *original, char escaped[LDS_MAX_PATH] ) {
     if ( ( *original >= 'a' && *original <= 'z' ) ||
          ( *original >= 'A' && *original <= 'Z' ) ||
          ( *original >= '0' && *original <= '9' ) ||
-         ( *original >= 45 && *original <= 47 ) ) {
+         ( *original >= 45 && *original <= 47 ) ||
+         ( *original == '_' ) ) {
       // No escape.
     } else {
       *e_temp++ = '\\';
@@ -275,7 +277,7 @@ int lds_remove_item( int wd, char *name ) {
 }
 
 // Create a file in destination path.
-int lds_sync_file( char *path ) {
+int lds_sync_file( char *path, int modify ) {
   char destination[LDS_MAX_PATH];
   char e_path[LDS_MAX_PATH * 2];
   char e_destination[LDS_MAX_PATH * 2];
@@ -293,7 +295,11 @@ int lds_sync_file( char *path ) {
   }
   lds_escape_path( destination, e_destination );
   lds_escape_path( path, e_path );
-  sprintf( command, "%s %s %s > /dev/null 2>&1", lds_rsync_append, e_path, e_destination );
+  if ( modify == 1 ) {
+    sprintf( command, "%s %s %s > /dev/null 2>&1", lds_rsync_append, e_path, e_destination );
+  } else {
+    sprintf( command, "%s %s %s > /dev/null 2>&1", lds_rsync_partial, e_path, e_destination );
+  }
   fprintf( stderr, "Sync file: %s\n", command );
 
   // Run the command.
@@ -406,7 +412,7 @@ void *lds_notifier_worker( void * args ) {
           } else {
             // File was created, add it to watcher.
             fprintf( stderr, "File created: %s\n", temp_path );
-            if ( lds_sync_file( temp_path ) == 0 ) {
+            if ( lds_sync_file( temp_path, 0 ) == 0 ) {
               i += LDS_EVENT_SIZE + event->len;
             }
           }
@@ -427,22 +433,35 @@ void *lds_notifier_worker( void * args ) {
             // Item was renamed.
             fprintf( stderr, "Rename: %s => %s\n", temp_path, next_path );
             lds_rename_item( temp_path, next_path );
+            if ( event->mask & IN_ISDIR ) {
+              // Perform sync of this directory.
+              lds_sync_directory( next_path );
+            } else {
+              // Perform sync of this new file.
+              lds_sync_file( next_path, 0 );
+            }
           } else {
             if ( event->mask & IN_ISDIR ) {
               // Directory was moved from an external directory into this directory.
               fprintf( stderr, "Directory moved into watched dir: %s\n", temp_path );
+              if ( lds_watch_directory( temp_path ) == 0 ) {
+                fprintf( stderr, "Error watching directory: %s\n", temp_path );
+              }
             } else {
               // File was moved from an external directory into this directory.
               fprintf( stderr, "File moved into watched dir: %s\n", temp_path );
+              lds_sync_file( temp_path, 0 );
             }
           }
-        } else if ( event->mask & IN_MOVED_TO ) {
+        } else if ( event->mask & IN_MOVED_TO && event->cookie == 0 ) {
           if ( event->mask & IN_ISDIR ) {
             // Directory was moved to.
             fprintf( stderr, "Directory moved: %s\n", temp_path );
+            lds_remove_item( event->wd, event->name );
           } else {
             // File was moved to.
             fprintf( stderr, "File moved:%s\n", temp_path );
+            lds_remove_item( event->wd, event->name );
           }
         } else if ( event->mask & IN_MODIFY || event->mask & IN_ATTRIB ) {
           // Check if it's a file.
@@ -460,7 +479,7 @@ void *lds_notifier_worker( void * args ) {
           if ( event->mask & IN_MODIFY ) {
             // File was modified.
             fprintf( stderr, "File modified: %s\n", temp_path );
-            if ( lds_sync_file( temp_path ) == 0 ) {
+            if ( lds_sync_file( temp_path, 1 ) == 0 ) {
               i += LDS_EVENT_SIZE + event->len;
               continue;
             }
